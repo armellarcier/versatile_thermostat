@@ -153,10 +153,12 @@ async def test_off_before_the_relay_confirms_a_turn_on_turns_the_relay_off(hass:
 
 
 @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later", return_value=MagicMock())
-async def test_first_tick_turns_on_a_relay_commanded_off_but_still_shown_on(mock_call_later):
+async def test_first_tick_turns_on_a_relay_commanded_off_but_still_shown_on(mock_call_later, hass):
     """Scheduler level: an underlying shown on, but commanded off, gets turn_on on the first tick."""
-    relay = make_underlying("R1", active=True)  # HA still shows "on"
-    relay.is_on_part_running = False  # the last command was turn_off
+    relay = await make_underlying(hass, "R1", active=True, confirms=False)  # a slow relay, shown on
+    await relay.turn_off()  # not confirmed: HA still shows "on"
+    assert relay.is_device_active is True
+    relay.turn_on.reset_mock()
     scheduler = CycleScheduler(make_hass(), make_thermostat(), [relay], 1800)
 
     await scheduler.start_cycle(VThermHvacMode_HEAT, 0.33, force=True)
@@ -165,11 +167,13 @@ async def test_first_tick_turns_on_a_relay_commanded_off_but_still_shown_on(mock
 
 
 @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later", return_value=MagicMock())
-async def test_first_tick_turns_off_a_relay_commanded_on_but_still_shown_off(mock_call_later):
+async def test_first_tick_turns_off_a_relay_commanded_on_but_still_shown_off(mock_call_later, hass):
     """Scheduler level, the mirror case: an underlying in its OFF part, shown off, but commanded on, gets turn_off on the first tick."""
-    first = make_underlying("R1")
-    second = make_underlying("R2", active=False)  # HA still shows "off"
-    second.is_on_part_running = True  # the last command was turn_on
+    first = await make_underlying(hass, "R1")
+    second = await make_underlying(hass, "R2", confirms=False)  # a slow relay, shown off
+    await second.turn_on()  # not confirmed: HA still shows "off"
+    assert second.is_device_active is False
+    second.turn_off.reset_mock()
     scheduler = CycleScheduler(make_hass(), make_thermostat(), [first, second], 1800)
 
     # With two underlyings, the second starts its ON part at mid-cycle: it is in its OFF part at t=0

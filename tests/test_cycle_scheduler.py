@@ -4,8 +4,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from unittest.mock import DEFAULT, MagicMock, AsyncMock, patch, call
+from unittest.mock import MagicMock, AsyncMock, patch, call
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
+from homeassistant.const import SERVICE_TURN_OFF, SERVICE_TURN_ON, STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from vtherm_api.command_receipt import (
     AppliedCommandReceipt,
     CommandAlteration,
@@ -15,7 +18,7 @@ from vtherm_api.command_receipt import (
 
 from custom_components.versatile_thermostat.cycle_scheduler import CycleScheduler
 from custom_components.versatile_thermostat.valve_command import ValveCommandMixin
-from custom_components.versatile_thermostat.underlyings import UnderlyingEntityType
+from custom_components.versatile_thermostat.underlyings import UnderlyingEntityType, UnderlyingSwitch
 from custom_components.versatile_thermostat.vtherm_hvac_mode import (
     VThermHvacMode_HEAT,
     VThermHvacMode_COOL,
@@ -28,30 +31,69 @@ from custom_components.versatile_thermostat.vtherm_hvac_mode import (
 # ─────────────────────────────────────────────
 
 
-def make_underlying(name="R1", active=False, entity_type=UnderlyingEntityType.SWITCH):
-    """Create a mock underlying entity.
+SLOW_SWITCHES = "test_cycle_scheduler_slow_switches"
 
-    Like a real switch, an accepted command updates both the commanded state
-    (is_on_part_running) and the observed state (is_device_active). A refused
-    turn_on (turn_on.return_value = False) records nothing.
+
+def set_switch_state(hass: HomeAssistant, entity_id: str, is_on: bool, ago: float = 0.0):
+    """HA shows the switch on or off, since `ago` seconds."""
+    hass.states.async_set(entity_id, STATE_ON if is_on else STATE_OFF, timestamp=time.time() - ago)
+
+
+def _register_switch_services(hass: HomeAssistant):
+    """A fake switch integration: a command reaches HA, and the relay confirms it at once, unless it is slow."""
+    if hass.services.has_service(SWITCH_DOMAIN, SERVICE_TURN_ON):
+        return
+
+    async def _command(service_call):
+        entity_ids = service_call.data["entity_id"]
+        for entity_id in [entity_ids] if isinstance(entity_ids, str) else entity_ids:
+            if entity_id not in hass.data.get(SLOW_SWITCHES, set()):
+                set_switch_state(hass, entity_id, service_call.service == SERVICE_TURN_ON)
+
+    hass.services.async_register(SWITCH_DOMAIN, SERVICE_TURN_ON, _command)
+    hass.services.async_register(SWITCH_DOMAIN, SERVICE_TURN_OFF, _command)
+
+
+async def make_underlying(
+    hass: HomeAssistant, name="R1", active=False, entity_type=UnderlyingEntityType.SWITCH, last_change_ago: float = 1000.0, confirms: bool = True
+):
+    """Create an underlying for the scheduler tests.
+
+    A switch is a real UnderlyingSwitch. HA shows it as `switch.<name>`, on or off since `last_change_ago` seconds.
+    Its commands reach a fake switch service that confirms them at once, or never if `confirms` is False (a slow
+    relay). Only the thermostat and the power check are stubbed. turn_on and turn_off are wrapped: tests can count
+    the calls, and set return_value or side_effect to replace the real command. Valves are mocks.
     """
+    if entity_type is not UnderlyingEntityType.SWITCH:
+        return make_mock_underlying(name, active, entity_type)
+
+    _register_switch_services(hass)
+    entity_id = f"switch.{name.lower()}"
+    if not confirms:
+        hass.data.setdefault(SLOW_SWITCHES, set()).add(entity_id)
+    set_switch_state(hass, entity_id, active, ago=last_change_ago)
+
+    thermostat = MagicMock()
+    thermostat.now = dt_util.utcnow()
+    thermostat.is_inversed = False
+    thermostat.init_underlyings_completed = AsyncMock()
+    thermostat.update_states = AsyncMock()
+    thermostat.__str__ = lambda self: "MockThermostat"
+    under = UnderlyingSwitch(hass, thermostat, entity_id, 0)
+    under.check_overpowering = AsyncMock(return_value=True)
+    under.startup()
+    await hass.async_block_till_done()
+
+    under.turn_on = AsyncMock(wraps=under.turn_on)
+    under.turn_off = AsyncMock(wraps=under.turn_off)
+    return under
+
+
+def make_mock_underlying(name="R1", active=False, entity_type=UnderlyingEntityType.SWITCH):
+    """Create a mock underlying entity (used for valves)."""
     under = MagicMock()
-
-    def _record(is_on: bool):
-        under.is_on_part_running = is_on
-        under.is_device_active = is_on
-
-    async def _turn_on():
-        if under.turn_on.return_value is not False:
-            _record(True)
-        return DEFAULT
-
-    async def _turn_off():
-        _record(False)
-        return DEFAULT
-
-    under.turn_on = AsyncMock(return_value=True, side_effect=_turn_on)
-    under.turn_off = AsyncMock(side_effect=_turn_off)
+    under.turn_on = AsyncMock(return_value=True)
+    under.turn_off = AsyncMock()
     under.set_valve_open_percent = AsyncMock()
     under.is_device_active = active
     under.is_on_part_running = None
@@ -99,10 +141,10 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("on_percent", [0.8, 1.0])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_refused_start_stops_before_next_underlying(self, mock_call_later, on_percent):
+    async def test_refused_start_stops_before_next_underlying(self, mock_call_later, on_percent, hass):
         """An explicit refusal stops the attempt and cleans all current relays."""
         thermostat = make_thermostat()
-        underlyings = [make_underlying("R1"), make_underlying("R2"), make_underlying("R3")]
+        underlyings = [await make_underlying(hass, "R1"), await make_underlying(hass, "R2"), await make_underlying(hass, "R3")]
         underlyings[0].turn_on.return_value = False
         scheduler = CycleScheduler(make_hass(), thermostat, underlyings, 600)
 
@@ -132,10 +174,10 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("on_percent", [0.5, 1.0])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_command_error_keeps_existing_handling(self, mock_call_later, on_percent):
+    async def test_command_error_keeps_existing_handling(self, mock_call_later, on_percent, hass):
         """A service exception is not reclassified as an explicit refusal."""
         thermostat = make_thermostat()
-        underlying = make_underlying()
+        underlying = await make_underlying(hass)
         underlying.turn_on.side_effect = RuntimeError("service failed")
         scheduler = CycleScheduler(make_hass(), thermostat, [underlying], 600)
 
@@ -151,12 +193,12 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("on_percent", [0.5, 1.0])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cleanup_error_does_not_continue_start(self, mock_call_later, on_percent):
+    async def test_cleanup_error_does_not_continue_start(self, mock_call_later, on_percent, hass):
         """A failed cleanup must escape rather than rearming the refused attempt."""
         thermostat = make_thermostat()
         thermostat.async_underlying_entity_turn_off = AsyncMock(side_effect=RuntimeError("cleanup failed"))
-        first = make_underlying("R1")
-        second = make_underlying("R2")
+        first = await make_underlying(hass, "R1")
+        second = await make_underlying(hass, "R2")
         first.turn_on.return_value = False
         scheduler = CycleScheduler(make_hass(), thermostat, [first, second], 600)
 
@@ -170,10 +212,10 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("on_percent", [0.5, 1.0])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_none_result_is_not_refusal(self, mock_call_later, on_percent):
+    async def test_none_result_is_not_refusal(self, mock_call_later, on_percent, hass):
         """A historical no-result command still follows the normal schedule."""
         thermostat = make_thermostat()
-        underlying = make_underlying()
+        underlying = await make_underlying(hass)
         underlying.turn_on.return_value = None
         scheduler = CycleScheduler(make_hass(), thermostat, [underlying], 600)
 
@@ -187,11 +229,11 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("replace", [True, False])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_refusal_does_not_clean_replaced_or_cancelling_cycle(self, mock_call_later, on_percent, replace):
+    async def test_refusal_does_not_clean_replaced_or_cancelling_cycle(self, mock_call_later, on_percent, replace, hass):
         """Local cleanup cannot cancel a replacement or reenter cancellation."""
         thermostat = make_thermostat()
         thermostat.async_underlying_entity_turn_off = AsyncMock()
-        underlying = make_underlying()
+        underlying = await make_underlying(hass)
         scheduler = CycleScheduler(make_hass(), thermostat, [underlying], 600)
 
         async def refuse():
@@ -208,7 +250,7 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_later_tick_refusal_cancels_both_handles_and_stops_all(self, mock_call_later, freezer):
+    async def test_later_tick_refusal_cancels_both_handles_and_stops_all(self, mock_call_later, freezer, hass):
         """A refused later relay cannot leave an earlier one on without a timer."""
         freezer.move_to("2024-01-01T00:00:00Z")
         handles = []
@@ -224,8 +266,8 @@ class TestCycleSchedulerLifecycle:
 
         mock_call_later.side_effect = register_timer
         thermostat = make_thermostat()
-        first = make_underlying("R1")
-        second = make_underlying("R2")
+        first = await make_underlying(hass, "R1")
+        second = await make_underlying(hass, "R2")
         second.turn_on.return_value = False
         scheduler = CycleScheduler(make_hass(), thermostat, [first, second], 600)
 
@@ -237,7 +279,8 @@ class TestCycleSchedulerLifecycle:
         thermostat.async_underlying_entity_turn_off = AsyncMock(side_effect=collective_off)
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True)
         assert len([handle for handle in handles if handle["active"]]) == 2
-        first.is_device_active = True
+        await hass.async_block_till_done()  # the relay confirms the turn_on
+        assert first.is_device_active is True
         freezer.tick(timedelta(seconds=300))
         tick = next(handle for handle in handles if handle["delay"] == 300)
         tick["active"] = False
@@ -253,7 +296,7 @@ class TestCycleSchedulerLifecycle:
     @pytest.mark.parametrize("elapsed", [0, 30])
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_interruption_cancels_undistributed_deadlines(self, mock_call_later, freezer, elapsed):
+    async def test_interruption_cancels_undistributed_deadlines(self, mock_call_later, freezer, elapsed, hass):
         """Ordinary OFF cancels distinct timers without crediting or restarting."""
         freezer.move_to("2024-01-01T00:00:00Z")
         handles = []
@@ -274,7 +317,7 @@ class TestCycleSchedulerLifecycle:
 
         mock_call_later.side_effect = register_timer
         thermostat = make_thermostat()
-        underlying = make_underlying()
+        underlying = await make_underlying(hass)
         scheduler = CycleScheduler(make_hass(), thermostat, [underlying], 300)
         cycle_end = AsyncMock()
         scheduler.register_cycle_end_callback(cycle_end)
@@ -309,15 +352,14 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_start_cycle_single_underlying(self, mock_call_later, freezer):
+    async def test_start_cycle_single_underlying(self, mock_call_later, freezer, hass):
         """Single underlying: turn_on immediately, schedule turn_off and cycle_end."""
         freezer.move_to("2024-01-01T00:00:00Z")
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.2, force=True)
@@ -334,16 +376,15 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_start_cycle_two_underlyings(self, mock_call_later, freezer):
+    async def test_start_cycle_two_underlyings(self, mock_call_later, freezer, hass):
         """Two underlyings with 50%: R1 on immediately, R2 scheduled at 300s."""
         freezer.move_to("2024-01-01T00:00:00Z")
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
-        r2 = make_underlying("R2")
+        r1 = await make_underlying(hass, "R1")
+        r2 = await make_underlying(hass, "R2")
         scheduler = CycleScheduler(hass, thermostat, [r1, r2], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True)
@@ -361,15 +402,14 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_hvac_off_turns_off_all(self, mock_call_later):
+    async def test_hvac_off_turns_off_all(self, mock_call_later, hass):
         """HVAC_OFF: all underlyings turned off, cycle scheduled for re-evaluation."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=True)
-        r2 = make_underlying("R2", active=True)
+        r1 = await make_underlying(hass, "R1", active=True)
+        r2 = await make_underlying(hass, "R2", active=True)
         scheduler = CycleScheduler(hass, thermostat, [r1, r2], 600)
 
         await scheduler.start_cycle(VThermHvacMode_OFF, 0.0, force=True)
@@ -383,14 +423,13 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_zero_on_time_turns_off_all(self, mock_call_later):
+    async def test_zero_on_time_turns_off_all(self, mock_call_later, hass):
         """on_time=0: all underlyings turned off."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=True)
+        r1 = await make_underlying(hass, "R1", active=True)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.0, force=True)
@@ -400,15 +439,12 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_zero_on_time_turns_off_unobserved_on_command(self, mock_call_later):
+    async def test_zero_on_time_turns_off_unobserved_on_command(self, mock_call_later, hass):
         """A zero-percent cycle turns off a switch before its ON state is observed."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying()
-        r1.is_on_part_running = False
-        r1.turn_on.side_effect = lambda: setattr(r1, "is_on_part_running", True)
+        r1 = await make_underlying(hass, confirms=False)  # a slow relay: HA still shows it off after turn_on
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True)
@@ -421,15 +457,14 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_full_power_all_on_immediately(self, mock_call_later):
+    async def test_full_power_all_on_immediately(self, mock_call_later, hass):
         """100% power: all underlyings turned on immediately."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
-        r2 = make_underlying("R2")
+        r1 = await make_underlying(hass, "R1")
+        r2 = await make_underlying(hass, "R2")
         scheduler = CycleScheduler(hass, thermostat, [r1, r2], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 1.0, force=True)
@@ -444,14 +479,13 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cancel_cycle(self, mock_call_later):
+    async def test_cancel_cycle(self, mock_call_later, hass):
         """cancel_cycle cancels all scheduled actions."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.2, force=True)
@@ -463,14 +497,13 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_no_restart_without_force(self, mock_call_later):
+    async def test_no_restart_without_force(self, mock_call_later, hass):
         """Without force=True, a running cycle is not restarted."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.2, force=True)
@@ -484,14 +517,13 @@ class TestCycleSchedulerLifecycle:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_force_restart_cancels_previous(self, mock_call_later):
+    async def test_force_restart_cancels_previous(self, mock_call_later, hass):
         """force=True cancels previous cycle and starts new one."""
         mock_cancel = MagicMock()
         mock_call_later.return_value = mock_cancel
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.2, force=True)
@@ -520,13 +552,12 @@ class TestCycleSchedulerCallbacks:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_start_callback_fired(self, mock_call_later):
+    async def test_cycle_start_callback_fired(self, mock_call_later, hass):
         """Cycle start callbacks are fired at the beginning of start_cycle."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         cb = AsyncMock()
@@ -543,14 +574,13 @@ class TestCycleSchedulerCallbacks:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_end_callback_fired(self, mock_call_later):
+    async def test_cycle_end_callback_fired(self, mock_call_later, hass):
         """Cycle end callbacks are fired at master cycle end via cancel_cycle."""
         import time as _time
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=False)
+        r1 = await make_underlying(hass, "R1", active=False)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         cb_end = AsyncMock()
@@ -584,15 +614,15 @@ class TestCycleSchedulerCallbacks:
         mock_call_later,
         entity_type,
         expected_class,
+        hass,
     ):
         """Valve-based schedulers must keep cycle callbacks active for SmartPI."""
         import time as _time
 
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        valve = make_underlying("V1", active=False, entity_type=entity_type)
+        valve = await make_underlying(hass, "V1", active=False, entity_type=entity_type)
         scheduler = CycleScheduler(hass, thermostat, [valve], 600)
 
         assert scheduler.is_valve_mode is True, expected_class
@@ -621,15 +651,15 @@ class TestCycleSchedulerCallbacks:
     async def test_apply_valve_update_keeps_current_cycle_callbacks_stable(
         self,
         mock_call_later,
+        hass,
     ):
         """A deferred valve recompute must not emit a new cycle start callback."""
         import time as _time
 
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        valve = make_underlying("V1", active=False, entity_type=UnderlyingEntityType.VALVE)
+        valve = await make_underlying(hass, "V1", active=False, entity_type=UnderlyingEntityType.VALVE)
         scheduler = CycleScheduler(hass, thermostat, [valve], 600)
 
         cb_start = AsyncMock()
@@ -658,6 +688,7 @@ class TestCycleSchedulerCallbacks:
     async def test_valve_cycle_uses_command_retained_by_thermostat(
         self,
         mock_call_later,
+        hass,
     ):
         """Valve updates must send and trace the thermostat-retained command."""
         mock_call_later.return_value = MagicMock()
@@ -679,9 +710,8 @@ class TestCycleSchedulerCallbacks:
             def __str__(self):
                 return "ValveThermostat"
 
-        hass = make_hass()
         thermostat = ValveThermostat()
-        valve = make_underlying("V1", active=False, entity_type=UnderlyingEntityType.VALVE)
+        valve = await make_underlying(hass, "V1", active=False, entity_type=UnderlyingEntityType.VALVE)
         scheduler = CycleScheduler(hass, thermostat, [valve], 600)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.234, force=True)
@@ -706,14 +736,14 @@ class TestCycleSchedulerCallbacks:
         self,
         mock_call_later,
         mock_time,
+        hass,
     ):
         """Valve e_eff must reflect the real average of applied mid-cycle commands."""
         mock_call_later.return_value = MagicMock()
         mock_time.side_effect = [1000.0, 1300.0, 1600.0]
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        valve = make_underlying("V1", active=False, entity_type=UnderlyingEntityType.VALVE)
+        valve = await make_underlying(hass, "V1", active=False, entity_type=UnderlyingEntityType.VALVE)
         scheduler = CycleScheduler(hass, thermostat, [valve], 600)
 
         cb_end = AsyncMock()
@@ -734,13 +764,12 @@ class TestCycleSchedulerCallbacks:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_callback_error_does_not_break_cycle(self, mock_call_later):
+    async def test_callback_error_does_not_break_cycle(self, mock_call_later, hass):
         """An error in a callback should not prevent the cycle from starting."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
 
         failing_cb = AsyncMock(side_effect=RuntimeError("test error"))
@@ -763,13 +792,12 @@ class TestMasterCycleEnd:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_end_does_not_turn_off_underlyings(self, mock_call_later):
+    async def test_cycle_end_does_not_turn_off_underlyings(self, mock_call_later, hass):
         """At cycle end, underlyings are NOT turned off. The next cycle's tick handles state."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=True)
+        r1 = await make_underlying(hass, "R1", active=True)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
         scheduler._current_on_time_sec = 300  # < 600
         scheduler._current_off_time_sec = 300
@@ -784,13 +812,12 @@ class TestMasterCycleEnd:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_end_full_power_no_turn_off(self, mock_call_later):
+    async def test_cycle_end_full_power_no_turn_off(self, mock_call_later, hass):
         """At cycle end with 100% power, underlyings are NOT turned off."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=True)
+        r1 = await make_underlying(hass, "R1", active=True)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
         scheduler._current_on_time_sec = 600  # == cycle_duration
         scheduler._current_off_time_sec = 0
@@ -805,13 +832,12 @@ class TestMasterCycleEnd:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_end_increments_energy(self, mock_call_later):
+    async def test_cycle_end_increments_energy(self, mock_call_later, hass):
         """Energy is incremented at cycle end."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=False)
+        r1 = await make_underlying(hass, "R1", active=False)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
         scheduler._current_on_time_sec = 120
         scheduler._current_off_time_sec = 480
@@ -825,13 +851,12 @@ class TestMasterCycleEnd:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_cycle_end_restarts_cycle(self, mock_call_later):
+    async def test_cycle_end_restarts_cycle(self, mock_call_later, hass):
         """Master cycle end restarts the cycle with same parameters."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1", active=False)
+        r1 = await make_underlying(hass, "R1", active=False)
         scheduler = CycleScheduler(hass, thermostat, [r1], 600)
         scheduler._current_on_time_sec = 120
         scheduler._current_off_time_sec = 480
@@ -855,14 +880,13 @@ class TestUnderlyingStateUpdates:
 
     @pytest.mark.asyncio
     @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later")
-    async def test_underlying_times_updated(self, mock_call_later):
+    async def test_underlying_times_updated(self, mock_call_later, hass):
         """start_cycle updates _on_time_sec, _off_time_sec, _hvac_mode on underlyings."""
         mock_call_later.return_value = MagicMock()
 
-        hass = make_hass()
         thermostat = make_thermostat()
-        r1 = make_underlying("R1")
-        r2 = make_underlying("R2")
+        r1 = await make_underlying(hass, "R1")
+        r2 = await make_underlying(hass, "R2")
         scheduler = CycleScheduler(hass, thermostat, [r1, r2], 600)
 
         await scheduler.start_cycle(VThermHvacMode_COOL, 0.3, force=True)
@@ -944,16 +968,16 @@ VALVE_ENTITY_TYPES = pytest.mark.parametrize(
 class TestCommandReceipts:
     """Tests for the AppliedCommandReceipt emission (vtherm_api command receipt contract)."""
 
-    async def test_scheduler_implements_receipt_protocol(self, _mock_call_later):
+    async def test_scheduler_implements_receipt_protocol(self, _mock_call_later, hass):
         """The scheduler satisfies the optional receipt protocol of vtherm_api."""
-        scheduler = CycleScheduler(make_hass(), make_thermostat(), [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), make_thermostat(), [await make_underlying(hass, "R1")], 600)
         assert isinstance(scheduler, InterfaceCommandReceiptScheduler)
         assert scheduler.is_valve_mode is False
 
-    async def test_switch_cycle_start_receipt(self, _mock_call_later):
+    async def test_switch_cycle_start_receipt(self, _mock_call_later, hass):
         """A switch cycle start emits CYCLE_START after the start callbacks and before the actuation."""
         events: list = []
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         r1.turn_on = AsyncMock(side_effect=lambda: events.append("turn_on"))
         scheduler = CycleScheduler(make_hass(), make_thermostat(), [r1], 600)
 
@@ -981,10 +1005,10 @@ class TestCommandReceipts:
         assert receipt.is_repeat is False
         assert receipt.alterations == frozenset()
 
-    async def test_switch_repeat_keeps_request_id(self, _mock_call_later):
+    async def test_switch_repeat_keeps_request_id(self, _mock_call_later, hass):
         """The automatic restart emits CYCLE_START with is_repeat and the same request."""
         events: list = []
-        scheduler = CycleScheduler(make_hass(), make_thermostat(), [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), make_thermostat(), [await make_underlying(hass, "R1")], 600)
 
         async def on_end(**_kwargs):
             events.append("end")
@@ -1010,9 +1034,9 @@ class TestCommandReceipts:
         assert repeat.applied_on_percent == pytest.approx(140 / 600)
         assert repeat.cycle_start_monotonic >= receipts[0].cycle_start_monotonic
 
-    async def test_switch_pending_request_receipt_at_next_cycle(self, _mock_call_later):
+    async def test_switch_pending_request_receipt_at_next_cycle(self, _mock_call_later, hass):
         """A request stored as pending emits no receipt until the next cycle applies it."""
-        scheduler = CycleScheduler(make_hass(), make_thermostat(), [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), make_thermostat(), [await make_underlying(hass, "R1")], 600)
         receipts = record_receipts(scheduler)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True, request_id=1)
@@ -1033,12 +1057,12 @@ class TestCommandReceipts:
         [(0.05, 0.0), (0.95, 1.0)],
         ids=["min_activation", "min_deactivation"],
     )
-    async def test_switch_min_on_off_alteration_is_sticky(self, _mock_call_later, on_percent, expected_applied):
+    async def test_switch_min_on_off_alteration_is_sticky(self, _mock_call_later, on_percent, expected_applied, hass):
         """Min on/off delays flag MIN_ON_OFF, kept by the automatic restart."""
         scheduler = CycleScheduler(
             make_hass(),
             make_thermostat(),
-            [make_underlying("R1")],
+            [await make_underlying(hass, "R1")],
             600,
             min_activation_delay=60,
             min_deactivation_delay=60,
@@ -1060,9 +1084,9 @@ class TestCommandReceipts:
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True, request_id=4)
         assert receipts[-1].alterations == frozenset()
 
-    async def test_untagged_request_receipt(self, _mock_call_later):
+    async def test_untagged_request_receipt(self, _mock_call_later, hass):
         """A positional call without request_id (TPI) emits receipts with request_id None."""
-        scheduler = CycleScheduler(make_hass(), make_thermostat(), [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), make_thermostat(), [await make_underlying(hass, "R1")], 600)
         receipts = record_receipts(scheduler)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.2, True)
@@ -1071,9 +1095,9 @@ class TestCommandReceipts:
         assert receipts[0].request_id is None
         assert receipts[0].kind == CommandReceiptKind.CYCLE_START
 
-    async def test_idle_cycle_kept_with_other_request_id(self, mock_call_later):
+    async def test_idle_cycle_kept_with_other_request_id(self, mock_call_later, hass):
         """request_id does not take part in the idle cycle comparison."""
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(make_hass(), make_thermostat(), [r1], 600)
         receipts = record_receipts(scheduler)
 
@@ -1090,13 +1114,14 @@ class TestCommandReceipts:
         await end_master_cycle(scheduler)
         assert [r.request_id for r in receipts] == [1, 2]
 
-    async def test_no_receipt_callback_keeps_behaviour(self, mock_call_later):
+    async def test_no_receipt_callback_keeps_behaviour(self, mock_call_later, hass):
         """Without receipt callback, no receipt is built and the cycle behaves the same."""
 
         async def run(with_receipts: bool):
             mock_call_later.reset_mock()
-            r1 = make_underlying("R1")
-            r2 = make_underlying("R2")
+            # Fresh switches for each run: the minimal delays must not see the other run's commands
+            r1 = await make_underlying(hass, f"R1_{with_receipts}")
+            r2 = await make_underlying(hass, f"R2_{with_receipts}")
             start_cb = AsyncMock()
             end_cb = AsyncMock()
             scheduler = CycleScheduler(make_hass(), make_thermostat(), [r1, r2], 600, 30, 30)
@@ -1125,9 +1150,9 @@ class TestCommandReceipts:
 
         assert await run(with_receipts=True) == without_receipts
 
-    async def test_receipt_callback_exception_is_isolated(self, _mock_call_later):
+    async def test_receipt_callback_exception_is_isolated(self, _mock_call_later, hass):
         """An exception in a receipt callback is logged and does not break the cycle."""
-        r1 = make_underlying("R1")
+        r1 = await make_underlying(hass, "R1")
         scheduler = CycleScheduler(make_hass(), make_thermostat(), [r1], 600)
         failing_cb = AsyncMock(side_effect=RuntimeError("test error"))
         scheduler.register_command_receipt_callback(failing_cb)
@@ -1140,9 +1165,9 @@ class TestCommandReceipts:
         r1.turn_on.assert_called_once()
         assert scheduler.is_cycle_running is True
 
-    async def test_unregister_receipt_callback(self, _mock_call_later):
+    async def test_unregister_receipt_callback(self, _mock_call_later, hass):
         """The function returned by the registration removes the callback."""
-        scheduler = CycleScheduler(make_hass(), make_thermostat(), [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), make_thermostat(), [await make_underlying(hass, "R1")], 600)
         cb = AsyncMock()
         remove = scheduler.register_command_receipt_callback(cb)
 
@@ -1155,11 +1180,11 @@ class TestCommandReceipts:
         cb.assert_awaited_once()
 
     @VALVE_ENTITY_TYPES
-    async def test_valve_cycle_start_and_running_updates(self, _mock_call_later, entity_type):
+    async def test_valve_cycle_start_and_running_updates(self, _mock_call_later, entity_type, hass):
         """Valve: CYCLE_START with the retained value, then one UPDATE per running-cycle start_cycle."""
         events: list = []
         thermostat = FakeValveThermostat()
-        valve = make_underlying("V1", entity_type=entity_type)
+        valve = await make_underlying(hass, "V1", entity_type=entity_type)
         valve.set_valve_open_percent = AsyncMock(side_effect=lambda: events.append("valve"))
         scheduler = CycleScheduler(make_hass(), thermostat, [valve], 600)
 
@@ -1194,10 +1219,10 @@ class TestCommandReceipts:
             assert update.cycle_start_monotonic == start.cycle_start_monotonic
 
     @VALVE_ENTITY_TYPES
-    async def test_valve_retained_by_dpercent_is_sticky(self, _mock_call_later, entity_type):
+    async def test_valve_retained_by_dpercent_is_sticky(self, _mock_call_later, entity_type, hass):
         """A valve held back by dpercent flags VALVE_RETAINED, kept by the automatic restart."""
         thermostat = FakeValveThermostat(dpercent=5)
-        scheduler = CycleScheduler(make_hass(), thermostat, [make_underlying("V1", entity_type=entity_type)], 600)
+        scheduler = CycleScheduler(make_hass(), thermostat, [await make_underlying(hass, "V1", entity_type=entity_type)], 600)
         receipts = record_receipts(scheduler)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.40, force=True, request_id=1)
@@ -1221,10 +1246,10 @@ class TestCommandReceipts:
         assert repeat.alterations == frozenset({CommandAlteration.VALVE_RETAINED})
 
     @VALVE_ENTITY_TYPES
-    async def test_valve_deferred_update_receipt(self, _mock_call_later, entity_type):
+    async def test_valve_deferred_update_receipt(self, _mock_call_later, entity_type, hass):
         """apply_valve_update emits an UPDATE without request_id, inside and outside a cycle."""
         thermostat = FakeValveThermostat()
-        scheduler = CycleScheduler(make_hass(), thermostat, [make_underlying("V1", entity_type=entity_type)], 600)
+        scheduler = CycleScheduler(make_hass(), thermostat, [await make_underlying(hass, "V1", entity_type=entity_type)], 600)
         start_cb = AsyncMock()
         scheduler.register_cycle_start_callback(start_cb)
         receipts = record_receipts(scheduler)
@@ -1248,11 +1273,11 @@ class TestCommandReceipts:
         assert outside.applied_on_percent == pytest.approx(0.3)
         assert outside.cycle_start_monotonic is None
 
-    async def test_no_receipt_while_inhibited(self, _mock_call_later):
+    async def test_no_receipt_while_inhibited(self, _mock_call_later, hass):
         """The inhibition gate drops the commands: no receipt for a command that is not applied."""
         thermostat = make_thermostat()
         thermostat.is_inhibited = True
-        scheduler = CycleScheduler(make_hass(), thermostat, [make_underlying("R1")], 600)
+        scheduler = CycleScheduler(make_hass(), thermostat, [await make_underlying(hass, "R1")], 600)
         receipts = record_receipts(scheduler)
 
         await scheduler.start_cycle(VThermHvacMode_HEAT, 0.5, force=True, request_id=1)

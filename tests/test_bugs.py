@@ -839,12 +839,11 @@ async def test_bug_1777(mock_call_later, hass):
     fake_thermostat.minimal_activation_delay = 0
     fake_thermostat.minimal_deactivation_delay = 0
 
-    under = make_underlying()
+    under = await make_underlying(hass, last_change_ago=999999)  # no recent change
     under._should_be_on = False
     under._on_time_sec = 0
     under._off_time_sec = 0
     under._hvac_mode = None
-    under.last_change = None
 
     scheduler = CycleScheduler(hass, fake_thermostat, [under], 100)
 
@@ -921,7 +920,8 @@ async def test_bug_1777(mock_call_later, hass):
     under.turn_on.reset_mock()
     under.turn_off.reset_mock()
     mock_call_later.reset_mock()
-    under.is_device_active = True            # device currently on
+    await hass.async_block_till_done()  # the relay confirms: it is on
+    assert under.is_device_active is True
     await scheduler._on_master_cycle_end(None)
 
     assert under._should_be_on is False      # device should be off
@@ -948,12 +948,11 @@ async def test_bug_1921_keep_active_cycle_when_next_repeat_becomes_zero(mock_cal
     fake_thermostat.minimal_activation_delay = 480
     fake_thermostat.minimal_deactivation_delay = 480
 
-    under = make_underlying()
+    under = await make_underlying(hass, last_change_ago=999999)  # no recent change
     under._should_be_on = False
     under._on_time_sec = 0
     under._off_time_sec = 0
     under._hvac_mode = None
-    under.last_change = None
 
     scheduler = CycleScheduler(
         hass,

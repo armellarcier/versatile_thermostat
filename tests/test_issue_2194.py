@@ -8,11 +8,9 @@ minimal_activation_delay=899 s, an ON phase of 1224 s postponed by that delay mu
 start later and last 1224 s.
 """
 
-from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
-from homeassistant.util import dt as dt_util
 
 from custom_components.versatile_thermostat.cycle_scheduler import CycleScheduler
 from custom_components.versatile_thermostat.cycle_tick_logic import keep_on_duration_when_postponed
@@ -27,23 +25,9 @@ ON_PERCENT = 0.34
 ON_TIME = 1224
 
 
-def make_relay(last_change_ago: float, active: bool = False):
-    """Build a relay whose commands update its state and its last change, like a real switch."""
-    relay = make_underlying("R1", active=active)
-    relay.last_change = dt_util.utcnow() - timedelta(seconds=last_change_ago)
-
-    async def _turn_on():
-        relay.is_device_active = True
-        relay.last_change = dt_util.utcnow()
-        return True
-
-    async def _turn_off():
-        relay.is_device_active = False
-        relay.last_change = dt_util.utcnow()
-
-    relay.turn_on.side_effect = _turn_on
-    relay.turn_off.side_effect = _turn_off
-    return relay
+async def make_relay(hass, last_change_ago: float, active: bool = False):
+    """Build a real switch whose last change HA shows is `last_change_ago` seconds old."""
+    return await make_underlying(hass, "R1", active=active, last_change_ago=last_change_ago)
 
 
 def make_scheduler(relay):
@@ -59,10 +43,10 @@ def make_scheduler(relay):
 
 
 @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later", return_value=MagicMock())
-async def test_restart_keeps_the_whole_on_phase(mock_call_later, freezer):
+async def test_restart_keeps_the_whole_on_phase(mock_call_later, freezer, hass):
     """A relay re-stamped 39 s before the first cycle starts later and runs its full ON time."""
     freezer.move_to("2026-11-06T07:34:10Z")
-    relay = make_relay(39)
+    relay = await make_relay(hass, 39)
     scheduler = make_scheduler(relay)
 
     await scheduler.start_cycle(VThermHvacMode_HEAT, ON_PERCENT, force=True)
@@ -86,10 +70,10 @@ async def test_restart_keeps_the_whole_on_phase(mock_call_later, freezer):
 
 
 @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later", return_value=MagicMock())
-async def test_reload_after_a_real_stop_honours_min_deactivation(mock_call_later, freezer):
+async def test_reload_after_a_real_stop_honours_min_deactivation(mock_call_later, freezer, hass):
     """A new scheduler (entry reload) keeps the OFF delay of a relay really stopped 30 s ago."""
     freezer.move_to("2026-11-06T07:34:10Z")
-    relay = make_relay(30)
+    relay = await make_relay(hass, 30)
     scheduler = make_scheduler(relay)
 
     await scheduler.start_cycle(VThermHvacMode_HEAT, ON_PERCENT, force=True)
@@ -106,10 +90,10 @@ async def test_reload_after_a_real_stop_honours_min_deactivation(mock_call_later
 
 
 @patch("custom_components.versatile_thermostat.cycle_scheduler.async_call_later", return_value=MagicMock())
-async def test_off_commanded_by_vtherm_honours_min_deactivation(mock_call_later, freezer):
+async def test_off_commanded_by_vtherm_honours_min_deactivation(mock_call_later, freezer, hass):
     """A relay switched off through the VTherm OFF command keeps the OFF delay on the next cycle."""
     freezer.move_to("2026-11-06T07:34:10Z")
-    relay = make_relay(3600)
+    relay = await make_relay(hass, 3600)
     scheduler = make_scheduler(relay)
     await scheduler.start_cycle(VThermHvacMode_HEAT, ON_PERCENT, force=True)
     relay.turn_on.assert_called_once()
